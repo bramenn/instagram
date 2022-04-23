@@ -76,6 +76,7 @@ BridgeState.human_readable_errors.update(
         "ig-connection-fatal-error": "Instagram disconnected unexpectedly",
         "ig-auth-error": "Authentication error from Instagram: {message}",
         "ig-checkpoint": "Instagram checkpoint error. Please check the Instagram website.",
+        "ig-checkpoint-2": "Instagram checkpoint error. Please check the Instagram website.",
         "ig-consent-required": "Instagram requires a consent update. Please check the Instagram website.",
         "ig-checkpoint-locked": "Instagram checkpoint error. Please check the Instagram website.",
         "ig-rate-limit": "Got Instagram ratelimit error, waiting a few minutes before retrying...",
@@ -206,10 +207,7 @@ class User(DBUser, BaseUser):
                 self.log.warning(f"Failed to connect to Instagram: {e}, logging out")
                 await self.logout(error=e)
                 return
-            except IGCheckpointError as e:
-                self.log.debug("Checkpoint error content: %s", e.body)
-                raise
-            except (IGChallengeError, IGConsentRequiredError) as e:
+            except (IGChallengeError, IGConsentRequiredError, IGCheckpointError) as e:
                 await self._handle_checkpoint(e, on="connect", client=client)
                 return
         self.client = client
@@ -350,7 +348,7 @@ class User(DBUser, BaseUser):
         except Exception as e:
             self.log.exception("Exception while syncing")
             if isinstance(e, IGCheckpointError):
-                self.log.debug("Checkpoint error content: %s", e.body)
+                self.log.debug("Checkpoint error content: %s", e.body.serialize())
             await self.push_bridge_state(
                 BridgeStateEvent.UNKNOWN_ERROR, info={"python_error": str(e)}
             )
@@ -382,7 +380,7 @@ class User(DBUser, BaseUser):
                             f"Error while syncing for refresh, retrying in {minutes} minute{s}"
                         )
                         if isinstance(e, IGCheckpointError):
-                            self.log.debug("Checkpoint error content: %s", e.body)
+                            self.log.debug("Checkpoint error content: %s", e.body.serialize())
                         await self.push_bridge_state(
                             BridgeStateEvent.UNKNOWN_ERROR,
                             error="unknown-error",
@@ -397,7 +395,7 @@ class User(DBUser, BaseUser):
 
     async def _handle_checkpoint(
         self,
-        e: IGChallengeError | IGConsentRequiredError,
+        e: IGChallengeError | IGConsentRequiredError | IGCheckpointError,
         on: str,
         client: AndroidAPI | None = None,
     ) -> None:
@@ -409,6 +407,13 @@ class User(DBUser, BaseUser):
             await self.push_bridge_state(
                 BridgeStateEvent.BAD_CREDENTIALS,
                 error="ig-consent-required",
+                info=e.body.serialize(),
+            )
+            return
+        elif isinstance(e, IGCheckpointError):
+            await self.push_bridge_state(
+                BridgeStateEvent.BAD_CREDENTIALS,
+                error="ig-checkpoint-2",
                 info=e.body.serialize(),
             )
             return
@@ -467,8 +472,17 @@ class User(DBUser, BaseUser):
                 await asyncio.sleep(sleep_minutes * 60)
                 sleep_minutes += 2
             except IGCheckpointError as e:
-                self.log.debug("Checkpoint error content: %s", e.body)
-                raise
+                if sleep_minutes < 15:
+                    self.log.warning(
+                        "Got checkpoint_required error on sync (%s), retrying in %d minutes",
+                        e.body.serialize(),
+                        sleep_minutes,
+                    )
+                    await self.push_bridge_state(
+                        BridgeStateEvent.TRANSIENT_DISCONNECT, error="ig-checkpoint-2-transient"
+                    )
+                    await asyncio.sleep(sleep_minutes * 60)
+                    sleep_minutes += 2
             except (IGChallengeError, IGConsentRequiredError) as e:
                 await self._handle_checkpoint(e, on="sync")
                 return
